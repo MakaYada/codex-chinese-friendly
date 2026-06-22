@@ -1,7 +1,14 @@
 ﻿# Codex Desktop 国内网络使用指南：接入 DeepSeek、开启中文界面和自动化任务
 
 > Windows 纯国内网络实测流程：通过 CC Switch 把 Codex Desktop 接入 DeepSeek，再开启中文界面和自动化任务入口。
+---
+更新（2026.6.22）：
 
+1.自动化入口打不开的情况，是codex的更新修改了入口，现在的脚本已经适配
+
+2.新增了删除和恢复部分，可以自行删除这个复制版
+
+---
 ## 目录
 
 - [适合谁](#适合谁)
@@ -13,6 +20,7 @@
 - [4. 中文界面设置](#4-中文界面设置)
 - [5. 开启自动化入口](#5-开启自动化入口)
 - [6. 完整脚本](#6-完整脚本)
+- [7. 删除和恢复](#7-删除和恢复)
 - [常见问题](#常见问题)
 - [参考链接](#参考链接)
 
@@ -367,57 +375,73 @@ Start-Process -FilePath (Join-Path $dst "app\Codex.exe") -WorkingDirectory (Join
 <summary>只开启自动化入口的补丁脚本</summary>
 
 ```powershell
-# 这里直接定位前面已经复制好的 Codex。
+# 这里直接定位前面已经复制好的 Codex
 $dst = "$env:LOCALAPPDATA\CodexPatched\current"
 $asar = Join-Path $dst "app\resources\app.asar"
 $backup = "$asar.bak"
 
-# 关闭正在运行的 Codex，避免 app.asar 被占用。
+# 关闭正在运行的 Codex，避免 app.asar 被占用
 Get-Process Codex,codex -ErrorAction SilentlyContinue | Stop-Process -Force
 
-# 如果没有找到复制版，说明需要先运行“中文界面补丁脚本”。
-if (!(Test-Path $asar)) {
+if (!(Test-Path -LiteralPath $asar)) {
     throw "Patched Codex not found: $asar"
 }
 
-# 如果之前没有备份，这里补一个备份。
-if (!(Test-Path $backup)) {
-    Copy-Item $asar $backup -Force
+# 第一次修改前保留完整备份
+if (!(Test-Path -LiteralPath $backup)) {
+    Copy-Item -LiteralPath $asar -Destination $backup -Force
 }
 
-# 读取 app.asar。
 $bytes = [System.IO.File]::ReadAllBytes($asar)
 $enc = [System.Text.Encoding]::GetEncoding(28591)
 $text = $enc.GetString($bytes)
 
-# 这个 feature gate 控制左侧 Automations 入口是否显示。
-# 新旧字符串长度必须一致，避免破坏 asar 文件结构。
-$old = 'So(`3075919032`)'
+function Patch-AsciiSameLength {
+    param(
+        [byte[]] $Bytes,
+        [string] $Text,
+        [string] $Old,
+        [string] $New
+    )
+
+    if ($Old.Length -ne $New.Length) {
+        throw "Pattern length mismatch: [$Old] -> [$New]"
+    }
+
+    $count = 0
+    $start = 0
+    while (($idx = $Text.IndexOf($Old, $start, [System.StringComparison]::Ordinal)) -ge 0) {
+        $newBytes = [System.Text.Encoding]::ASCII.GetBytes($New)
+        [Array]::Copy($newBytes, 0, $Bytes, $idx, $newBytes.Length)
+        $count++
+        $start = $idx + $Old.Length
+    }
+
+    return $count
+}
+
+# Codex 26.616.6631.0 中控制自动化入口的新门控调用
+# 两个字符串长度都是 16，写回后不会改变 app.asar 的整体长度
+$old = '$a(`3075919032`)'
 $new = '(()=>!0)()      '
+$count = Patch-AsciiSameLength $bytes $text $old $new
 
-if ($old.Length -ne $new.Length) {
-    throw "Pattern length mismatch."
-}
-
-$count = 0
-$start = 0
-
-while (($idx = $text.IndexOf($old, $start, [System.StringComparison]::Ordinal)) -ge 0) {
-    $newBytes = [System.Text.Encoding]::ASCII.GetBytes($new)
-    [Array]::Copy($newBytes, 0, $bytes, $idx, $newBytes.Length)
-    $count++
-    $start = $idx + $old.Length
-}
-
-if ($count -gt 0) {
+if ($count -eq 1) {
     [System.IO.File]::WriteAllBytes($asar, $bytes)
-    Write-Host "Patched automations sidebar gate: $count"
+    Write-Host "Patched current automations sidebar gate: $count" -ForegroundColor Green
+} elseif ($count -gt 1) {
+    throw "Found $count current-version gate patterns; nothing was written."
+} elseif ($text.IndexOf($new, [System.StringComparison]::Ordinal) -ge 0) {
+    Write-Host "Current-version automations gate is already patched."
+} elseif ($text.IndexOf('So(`3075919032`)', [System.StringComparison]::Ordinal) -ge 0) {
+    throw "This is an older Codex build. Use the retained old-version script below."
 } else {
-    Write-Host "Automations pattern not found. It may already be patched, or this Codex version changed."
+    throw "Automations gate not found. This Codex version may have changed again."
 }
 
-# 启动复制版 Codex。
+# 启动复制版 Codex
 Start-Process -FilePath (Join-Path $dst "app\Codex.exe") -WorkingDirectory (Join-Path $dst "app")
+
 ```
 
 </details>
@@ -533,24 +557,24 @@ Start-Process -FilePath (Join-Path $dst "app\Codex.exe") -WorkingDirectory (Join
 <summary>中文版 + 自动化入口完整脚本</summary>
 
 ```powershell
-# 复制版 Codex 的保存目录。
+# 复制版 Codex 的保存目录
 $root = "$env:LOCALAPPDATA\CodexPatched"
 
-# 找到 Microsoft Store 安装的官方 Codex 包。
+# 找到 Microsoft Store 安装的官方 Codex 包
 $pkg = Get-AppxPackage OpenAI.Codex
 $src = $pkg.InstallLocation
 $version = $pkg.PackageFullName
 
-# current 是实际运行的复制版目录。
+# current 是实际运行的复制版目录
 $dst = Join-Path $root "current"
 $marker = Join-Path $root "version.txt"
 
-# 关闭正在运行的 Codex，避免文件占用。
+# 关闭正在运行的 Codex，避免文件占用
 Get-Process Codex,codex -ErrorAction SilentlyContinue | Stop-Process -Force
 
 New-Item -ItemType Directory -Path $root -Force | Out-Null
 
-# 如果官方版本变化，或者第一次运行，就重新复制。
+# 如果官方版本变化，或者第一次运行，就重新复制
 $needCopy = $true
 if ((Test-Path $dst) -and (Test-Path $marker)) {
     $needCopy = ((Get-Content $marker -Raw).Trim() -ne $version)
@@ -606,7 +630,7 @@ function Patch-AsciiSameLength {
     return $count
 }
 
-# 开启中文界面。
+# 开启中文界面
 $c = Patch-AsciiSameLength $bytes $text 'enable_i18n`,!1' 'enable_i18n`,!0'
 if ($c -gt 0) {
     Write-Host "Patched i18n: $c"
@@ -615,8 +639,9 @@ if ($c -gt 0) {
     Write-Host "i18n old pattern not found; may already be patched."
 }
 
-# 开启自动化侧边栏入口。
-$c = Patch-AsciiSameLength $bytes $text 'So(`3075919032`)' '(()=>!0)()      '
+# 开启新版自动化侧边栏入口
+# Codex 26.616.6631.0 中，门控调用已经从 So(...) 变成 $a(...)
+$c = Patch-AsciiSameLength $bytes $text '$a(`3075919032`)' '(()=>!0)()      '
 if ($c -gt 0) {
     Write-Host "Patched automations sidebar gate: $c"
     $changed = $true
@@ -635,6 +660,134 @@ Start-Process -FilePath (Join-Path $dst "app\Codex.exe") -WorkingDirectory (Join
 ```
 
 </details>
+
+## 7. 删除和恢复
+
+如果不想继续使用复制版，或者补丁后出现异常，可以按需要选择下面两种方式
+
+- **只删除复制版**：删除本教程生成的 `CodexPatched` 目录，保留 Microsoft Store 官方版、Codex 配置、聊天记录和自动化任务，然后重新打开官方版
+- **删除所有 Codex 程序版本**：卸载 Microsoft Store 官方版并删除复制版，但保留配置、项目、聊天记录、附件、技能和自动化任务等用户数据
+
+下面两个脚本都不会删除你的代码项目、聊天文件或 `.codex` 数据，也不会卸载 CC Switch。
+
+注意：删除过后复制版codex没有了，任务栏上手动固定的复制版图标会失效，需要右键取消固定。
+
+### 只删除复制版，恢复官方版
+
+适合想撤销中文界面和自动化入口补丁、继续使用官方 Codex 的情况。官方安装目录从未被修改，所以删除复制版后不需要修复官方文件
+
+先退出 Codex，再在 PowerShell 中运行下面脚本，需要根据提示输入 yes 确定：
+
+```powershell
+# 本教程生成的复制版目录；脚本只会删除这一个固定目录
+$root = Join-Path $env:LOCALAPPDATA "CodexPatched"
+
+Write-Host "即将删除复制版 Codex：$root" -ForegroundColor Yellow
+$confirm = Read-Host "确认删除请输入 yes"
+if ($confirm.Trim() -ine "yes") {
+    Write-Host "已取消，没有删除任何内容。"
+    return
+}
+
+# 关闭官方版和复制版进程，避免文件被占用
+Get-Process Codex,codex -ErrorAction SilentlyContinue | Stop-Process -Force
+
+if (Test-Path -LiteralPath $root) {
+    Remove-Item -LiteralPath $root -Recurse -Force
+    Write-Host "复制版 Codex 已删除：$root" -ForegroundColor Green
+} else {
+    Write-Host "没有找到复制版目录，无需删除：$root"
+}
+
+# 重新打开 Microsoft Store 安装的官方版 Codex
+$pkg = Get-AppxPackage OpenAI.Codex -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($pkg) {
+    try {
+        $manifest = Get-AppxPackageManifest $pkg
+        $appId = @($manifest.Package.Applications.Application)[0].Id
+        $aumid = "$($pkg.PackageFamilyName)!$appId"
+        Start-Process explorer.exe -ArgumentList "shell:AppsFolder\$aumid"
+        Write-Host "已重新打开官方版 Codex。" -ForegroundColor Green
+    } catch {
+        Write-Warning "复制版已删除，但自动打开官方版失败。请从开始菜单打开 Codex。"
+    }
+} else {
+    Write-Warning "复制版已删除，但没有检测到 Microsoft Store 官方版。请到 Microsoft Store 重新安装 Codex。"
+}
+
+```
+
+这个脚本不会删除 `%USERPROFILE%\.codex`，所以 Codex 的配置和本地数据会保留。如果以后还想使用中文版，重新运行第 6 节的完整脚本即可
+
+### 删除所有 Codex 程序版本，保留配置和聊天
+
+下面的脚本只删除当前 Windows 用户安装的 Codex 程序：
+
+- 卸载 Microsoft Store 安装的官方 Codex
+- 删除 `%LOCALAPPDATA%\CodexPatched` 复制版
+- 完整保留 `%USERPROFILE%\.codex` 中的配置、项目记录、聊天、附件、登录信息、技能和自动化任务
+- 不删除 `%APPDATA%\Codex` 和 `%LOCALAPPDATA%\Codex`
+
+确认后，在管理员 PowerShell 中运行，同样需要根据提示输入 yes 确定：
+
+```powershell
+# 收集当前用户安装的 Microsoft Store Codex 包
+$packages = @(Get-AppxPackage OpenAI.Codex -ErrorAction SilentlyContinue)
+
+# 只删除本教程生成的复制版程序目录
+$patchedRoot = Join-Path $env:LOCALAPPDATA "CodexPatched"
+
+Write-Host "将删除以下 Codex 程序版本：" -ForegroundColor Red
+if ($packages.Count -gt 0) {
+    $packages | ForEach-Object { Write-Host "  Microsoft Store：$($_.PackageFullName)" }
+} else {
+    Write-Host "  未检测到 Microsoft Store 官方版"
+}
+Write-Host "  复制版：$patchedRoot"
+Write-Host ""
+Write-Host "以下用户数据会保留：" -ForegroundColor Green
+Write-Host "  $env:USERPROFILE\.codex"
+Write-Host "  $env:APPDATA\Codex"
+Write-Host "  $env:LOCALAPPDATA\Codex"
+Write-Host "  代码项目和聊天附件"
+
+$confirm = Read-Host "确认只删除程序、保留数据，请输入 yes"
+if ($confirm.Trim() -ine "yes") {
+    Write-Host "已取消，没有删除任何内容。"
+    return
+}
+
+# 关闭官方版和复制版
+Get-Process Codex,codex -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# 卸载当前用户的 Microsoft Store 官方版
+foreach ($pkg in $packages) {
+    try {
+        Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop
+        Write-Host "已卸载官方版：$($pkg.PackageFullName)" -ForegroundColor Green
+    } catch {
+        Write-Warning "官方版卸载失败：$($_.Exception.Message)"
+    }
+}
+
+# 只删除复制版程序，不删除任何用户数据目录
+if (Test-Path -LiteralPath $patchedRoot) {
+    try {
+        Remove-Item -LiteralPath $patchedRoot -Recurse -Force -ErrorAction Stop
+        Write-Host "已删除复制版：$patchedRoot" -ForegroundColor Green
+    } catch {
+        Write-Warning "复制版删除失败：$($_.Exception.Message)"
+    }
+} else {
+    Write-Host "没有检测到复制版目录。"
+}
+
+Write-Host "Codex 程序版本已清理，配置、项目和聊天数据均已保留。" -ForegroundColor Green
+Write-Host "任务栏或开始菜单中手动固定的旧图标请右键取消固定。"
+
+```
+
+以后如果想恢复使用，重新从 Microsoft Store 安装 Codex 即可。`%USERPROFILE%\.codex`、代码项目和聊天文件一直保留，通常无需恢复
 
 ## 常见问题
 
