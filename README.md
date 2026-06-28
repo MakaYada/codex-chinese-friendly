@@ -9,6 +9,13 @@
 2.新增了删除和恢复部分，可以自行删除这个复制版
 
 ---
+更新（2026.6.28）：
+
+1.codex的更新修改了自动化入口，现在的脚本已经适配
+
+2.侧边栏入口的英文默认文案从 `Automations` 改成了 `Scheduled`，所以中文界面现在显示“已安排”而不是“自动化”
+
+---
 ## 目录
 
 - [适合谁](#适合谁)
@@ -387,7 +394,7 @@ if (!(Test-Path -LiteralPath $asar)) {
     throw "Patched Codex not found: $asar"
 }
 
-# 第一次修改前保留完整备份
+# 如果之前没有备份，这里补一个备份
 if (!(Test-Path -LiteralPath $backup)) {
     Copy-Item -LiteralPath $asar -Destination $backup -Force
 }
@@ -396,47 +403,67 @@ $bytes = [System.IO.File]::ReadAllBytes($asar)
 $enc = [System.Text.Encoding]::GetEncoding(28591)
 $text = $enc.GetString($bytes)
 
-function Patch-AsciiSameLength {
+# 按原始字节精确统计门控字符串出现次数
+function Get-OrdinalCount {
     param(
-        [byte[]] $Bytes,
         [string] $Text,
-        [string] $Old,
-        [string] $New
+        [string] $Pattern
     )
-
-    if ($Old.Length -ne $New.Length) {
-        throw "Pattern length mismatch: [$Old] -> [$New]"
-    }
 
     $count = 0
     $start = 0
-    while (($idx = $Text.IndexOf($Old, $start, [System.StringComparison]::Ordinal)) -ge 0) {
-        $newBytes = [System.Text.Encoding]::ASCII.GetBytes($New)
-        [Array]::Copy($newBytes, 0, $Bytes, $idx, $newBytes.Length)
+    while (($idx = $Text.IndexOf($Pattern, $start, [System.StringComparison]::Ordinal)) -ge 0) {
         $count++
-        $start = $idx + $Old.Length
+        $start = $idx + $Pattern.Length
     }
-
     return $count
 }
 
-# Codex 26.616.6631.0 中控制自动化入口的新门控调用
-# 两个字符串长度都是 16，写回后不会改变 app.asar 的整体长度
-$old = '$a(`3075919032`)'
-$new = '(()=>!0)()      '
-$count = Patch-AsciiSameLength $bytes $text $old $new
+# 这个 feature gate 控制左侧“已安排”/“自动化”入口是否显示
+# 旧版调用是 So(...)，26.616.6631.0 变成 $a(...)
+# Codex 26.623.5546.0 又变成 li(...)，之后版本暂时沿用这个最新规则
+# 新旧字符串长度必须一致，避免破坏 asar 文件结构
+$replacement = '(()=>!0)()      '
+$knownGates = @(
+    [PSCustomObject]@{ AppliesTo = '26.623.5546.0 及以后（暂用最新规则）';       Pattern = 'li(`3075919032`)' },
+    [PSCustomObject]@{ AppliesTo = '26.616.6631.0 至 26.623.5546.0 之前';       Pattern = '$a(`3075919032`)' },
+    [PSCustomObject]@{ AppliesTo = '26.616.6631.0 之前';                       Pattern = 'So(`3075919032`)' }
+)
 
-if ($count -eq 1) {
+$totalMatches = 0
+$matchedGate = $null
+
+# 先检查实际文件中存在的是哪一种门控调用
+foreach ($gate in $knownGates) {
+    if ($gate.Pattern.Length -ne $replacement.Length) {
+        throw "Pattern length mismatch: $($gate.Pattern)"
+    }
+
+    $count = Get-OrdinalCount $text $gate.Pattern
+    if ($count -gt 0) {
+        $totalMatches += $count
+        $matchedGate = $gate
+    }
+}
+
+# 只允许唯一命中；有多个结果或完全不认识的版本都不写入文件
+if ($totalMatches -eq 1) {
+    $idx = $text.IndexOf($matchedGate.Pattern, [System.StringComparison]::Ordinal)
+    $newBytes = [System.Text.Encoding]::ASCII.GetBytes($replacement)
+    [Array]::Copy($newBytes, 0, $bytes, $idx, $newBytes.Length)
     [System.IO.File]::WriteAllBytes($asar, $bytes)
-    Write-Host "Patched current automations sidebar gate: $count" -ForegroundColor Green
-} elseif ($count -gt 1) {
-    throw "Found $count current-version gate patterns; nothing was written."
-} elseif ($text.IndexOf($new, [System.StringComparison]::Ordinal) -ge 0) {
-    Write-Host "Current-version automations gate is already patched."
-} elseif ($text.IndexOf('So(`3075919032`)', [System.StringComparison]::Ordinal) -ge 0) {
-    throw "This is an older Codex build. Use the retained old-version script below."
+    Write-Host "Patched Scheduled/Automations sidebar gate. Rule: $($matchedGate.AppliesTo)." -ForegroundColor Green
+} elseif ($totalMatches -gt 1) {
+    throw "Found $totalMatches supported gate patterns; nothing was written."
 } else {
-    throw "Automations gate not found. This Codex version may have changed again."
+    $patchedCount = Get-OrdinalCount $text $replacement
+    if ($patchedCount -eq 1) {
+        Write-Host "Scheduled/Automations sidebar gate is already patched."
+    } elseif ($patchedCount -gt 1) {
+        throw "Found multiple patched markers; nothing was written."
+    } else {
+        throw "Scheduled/Automations gate not found. This Codex version may have changed again."
+    }
 }
 
 # 启动复制版 Codex
@@ -630,6 +657,24 @@ function Patch-AsciiSameLength {
     return $count
 }
 
+# 按原始字节精确统计门控字符串出现次数
+function Get-OrdinalCount {
+    param(
+        [string] $Text,
+        [string] $Pattern
+    )
+
+    $count = 0
+    $start = 0
+
+    while (($idx = $Text.IndexOf($Pattern, $start, [System.StringComparison]::Ordinal)) -ge 0) {
+        $count++
+        $start = $idx + $Pattern.Length
+    }
+
+    return $count
+}
+
 # 开启中文界面
 $c = Patch-AsciiSameLength $bytes $text 'enable_i18n`,!1' 'enable_i18n`,!0'
 if ($c -gt 0) {
@@ -640,13 +685,45 @@ if ($c -gt 0) {
 }
 
 # 开启新版自动化侧边栏入口
-# Codex 26.616.6631.0 中，门控调用已经从 So(...) 变成 $a(...)
-$c = Patch-AsciiSameLength $bytes $text '$a(`3075919032`)' '(()=>!0)()      '
-if ($c -gt 0) {
-    Write-Host "Patched automations sidebar gate: $c"
+$automationReplacement = '(()=>!0)()      '
+$knownAutomationGates = @(
+    [PSCustomObject]@{ AppliesTo = '26.623.5546.0 及以后（暂用最新规则）';       Pattern = 'li(`3075919032`)' },
+    [PSCustomObject]@{ AppliesTo = '26.616.6631.0 至 26.623.5546.0 之前';       Pattern = '$a(`3075919032`)' },
+    [PSCustomObject]@{ AppliesTo = '26.616.6631.0 之前';                       Pattern = 'So(`3075919032`)' }
+)
+
+$totalAutomationMatches = 0
+$matchedAutomationGate = $null
+
+# 先检查实际文件中存在的是哪一种门控调用
+foreach ($gate in $knownAutomationGates) {
+    if ($gate.Pattern.Length -ne $automationReplacement.Length) {
+        throw "Automation pattern length mismatch: $($gate.Pattern)"
+    }
+
+    $count = Get-OrdinalCount $text $gate.Pattern
+    if ($count -gt 0) {
+        $totalAutomationMatches += $count
+        $matchedAutomationGate = $gate
+    }
+}
+
+# 只允许唯一命中；有多个结果或完全不认识的版本都不写入文件
+if ($totalAutomationMatches -eq 1) {
+    $c = Patch-AsciiSameLength $bytes $text $matchedAutomationGate.Pattern $automationReplacement
+    Write-Host "Patched Scheduled/Automations sidebar gate. Rule: $($matchedAutomationGate.AppliesTo). Count: $c"
     $changed = $true
+} elseif ($totalAutomationMatches -gt 1) {
+    throw "Found $totalAutomationMatches supported automation gate patterns; nothing was written."
 } else {
-    Write-Host "Automations sidebar gate pattern not found; may already be patched or version changed."
+    $patchedCount = Get-OrdinalCount $text $automationReplacement
+    if ($patchedCount -eq 1) {
+        Write-Host "Scheduled/Automations sidebar gate is already patched."
+    } elseif ($patchedCount -gt 1) {
+        throw "Found multiple patched automation markers; nothing was written."
+    } else {
+        throw "Scheduled/Automations gate not found. This Codex version may have changed again."
+    }
 }
 
 if ($changed) {
